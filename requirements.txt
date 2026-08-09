@@ -1,5 +1,8 @@
+# anker-solix-api deklariert seine Dependencies nur im Poetry-Block der
+# pyproject.toml. pip liest den nicht, daher muessen alle hier stehen.
 anker-solix-api @ git+https://github.com/thomluther/anker-solix-api.git@main
-aiohttp>=3.9
-aiofiles>=23.0
-cryptography>=42.0
-
+aiohttp>=3.14.3
+aiofiles>=25.1.0
+cryptography>=50.0.0
+paho-mqtt>=2.1.0
+python-dotenv>=1.2.1
