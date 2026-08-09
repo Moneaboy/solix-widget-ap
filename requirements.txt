@@ -1,1 +1,5 @@
+anker-solix-api @ git+https://github.com/thomluther/anker-solix-api.git@main
+aiohttp>=3.9
+aiofiles>=23.0
+cryptography>=42.0
 
