@@ -117,14 +117,20 @@ def _num(value: object, default: float = 0.0) -> float:
 
 
 def _parse_time(value: str) -> float | None:
-    """'2025-07-18 13:22:23' -> Unix-Timestamp. Anker sendet Ortszeit."""
-    if not value or value.startswith("01-01-0001"):
+    """'2025-07-18 13:22:23' -> Unix-Timestamp. Anker sendet Ortszeit.
+
+    Manche Systeme liefern Platzhalter statt einer echten Zeit
+    ('01-01-0001...' oder '1970-01-01...'). Die gelten als 'keine Angabe',
+    sonst waeren die Daten rechnerisch Jahrzehnte alt.
+    """
+    if not value or value.startswith(("01-01-0001", "1970-01-01", "0001-01-01")):
         return None
     try:
-        naive = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-        return naive.astimezone().timestamp()
+        stamp = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").astimezone().timestamp()
     except ValueError:
         return None
+    # Alles vor 2020 ist ebenfalls ein Platzhalter
+    return stamp if stamp > 1577836800 else None
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +210,26 @@ def normalize(scene: dict) -> dict:
     now = time.time()
     age = int(now - updated) if updated else None
 
+    # Cloud-Verbindungsstatus der Geraete. Liefert die Solarbank keinen
+    # brauchbaren Zeitstempel, ist das die einzige Aktualitaetsaussage.
+    grid_devices = grid.get("grid_list") or []
+    online = bool(banks) and all(
+        str(d.get("status", "1")) == "1" for d in banks + grid_devices
+    )
+    errors = [int(_num(b.get("err_code"))) for b in banks]
+
+    # Namen der PV-Strings, wie in der Anker-App vergeben
+    names = (banks[0].get("pv_name") or {}) if banks else {}
+    pv_names = [
+        names.get(f"pv{i}_name") or f"PV{i}" for i in range(1, 5)
+    ]
+
     return {
         "ok": True,
         "ts": int(now),
         "age": age,
-        "stale": age is not None and age > STALE_AFTER,
+        "online": online,
+        "stale": (not online) or (age is not None and age > STALE_AFTER),
         # Die fuenf Kernwerte
         "pv": round(pv),
         "home": round(home),
@@ -222,7 +243,12 @@ def normalize(scene: dict) -> dict:
         "bat_discharge": round(discharge),
         # Ergaenzungen
         "pv_strings": [round(s) for s in strings],
+        "pv_names": pv_names,
         "sb_output": round(_num(sb.get("total_output_power"))),
+        "grid_to_battery": round(_num(sb.get("grid_to_battery_power"))),
+        "heating": round(_num(sb.get("pei_heating_power"))),
+        "feed_limit": round(_num(sb.get("micro_inverter_power_limit"))),
+        "err": max(errors) if errors else 0,
         "autarky": autarky,
         "runtime_min": runtime,
         "total_kwh": _num((stats.get("1") or {}).get("total")),
@@ -330,4 +356,3 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801  (Vercel erwartet diesen Na
                     "trace": traceback.format_exc(limit=4),
                 },
             )
-
