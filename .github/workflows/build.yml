@@ -1,0 +1,57 @@
+name: APK bauen
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "generate_project.py"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository holen
+        uses: actions/checkout@v4
+
+      - name: Java einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK einrichten
+        uses: android-actions/setup-android@v3
+
+      - name: Projekt erzeugen
+        run: python3 generate_project.py
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: APK bauen
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: APK umbenennen
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/*.apk \
+             out/solix-widget-${{ github.run_number }}.apk
+          ls -la out
+
+      - name: Als Release veröffentlichen
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Solix Widget Build ${{ github.run_number }}
+          body: |
+            Automatisch gebaut aus Commit ${{ github.sha }}.
+            APK unten antippen, um sie direkt auf dem Handy zu installieren.
+          files: out/*.apk
