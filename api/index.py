@@ -106,6 +106,20 @@ def kv_set(key: str, value: str, ttl: int | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Betriebsmodi, wie die Anker-App sie benennt
+MODE_NAMES = {
+    1: "Smartmeter",
+    2: "Smart Plugs",
+    3: "Manueller Plan",
+    4: "Notstrom",
+    5: "Nutzungszeit",
+    7: "KI-Modus",
+    8: "Dynam. Tarif",
+}
+
+CHARGE_NAMES = {"0": "bereit", "1": "lädt", "2": "entlädt", "3": "Bypass"}
+
+
 def _num(value: object, default: float = 0.0) -> float:
     """Anker liefert Zahlen mal als String, mal als Zahl, mal als None."""
     if value is None or value == "":
@@ -166,7 +180,7 @@ def _persist_auth_file(auth_file: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def normalize(scene: dict) -> dict:
+def normalize(scene: dict, today: dict | None = None) -> dict:
     sb = scene.get("solarbank_info") or {}
     grid = scene.get("grid_info") or {}
     banks = sb.get("solarbank_list") or []
@@ -206,6 +220,21 @@ def normalize(scene: dict) -> dict:
         autarky = max(0, min(100, round((home - grid_import) / home * 100)))
 
     stats = {s.get("type"): s for s in (scene.get("statistics") or [])}
+    total_kwh = _num((stats.get("1") or {}).get("total"))
+    total_eur = _num((stats.get("3") or {}).get("total"))
+
+    # Anker liefert fuer Tagesabfragen keinen Geldwert. Aus den
+    # Lebenszeit-Summen laesst sich der unterstellte Arbeitspreis
+    # ableiten und auf den heute selbst genutzten Strom anwenden.
+    # Das ist eine Schaetzung, keine Anker-Zahl.
+    self_used = ((today or {}).get("home_from_solar") or 0) + (
+        (today or {}).get("home_from_bat") or 0
+    )
+    today_eur = (
+        round(self_used * (total_eur / total_kwh), 2)
+        if total_kwh > 0 and self_used > 0
+        else None
+    )
     updated = _parse_time(sb.get("updated_time") or "")
     now = time.time()
     age = int(now - updated) if updated else None
@@ -213,6 +242,7 @@ def normalize(scene: dict) -> dict:
     # Cloud-Verbindungsstatus der Geraete. Liefert die Solarbank keinen
     # brauchbaren Zeitstempel, ist das die einzige Aktualitaetsaussage.
     grid_devices = grid.get("grid_list") or []
+    mode = scene.get("user_scene_mode") or scene.get("scene_mode")
     online = bool(banks) and all(
         str(d.get("status", "1")) == "1" for d in banks + grid_devices
     )
@@ -249,12 +279,36 @@ def normalize(scene: dict) -> dict:
         "heating": round(_num(sb.get("pei_heating_power"))),
         "feed_limit": round(_num(sb.get("micro_inverter_power_limit"))),
         "err": max(errors) if errors else 0,
+        # Gruppe B: Zustand und Einstellungen aus derselben Antwort
+        "mode": mode,
+        "mode_text": MODE_NAMES.get(mode, f"Modus {mode}" if mode else "-"),
+        "retain_load": round(_num(scene.get("retain_load"))),
+        "backup_full_min": (
+            round(_num((sb.get("backup_info") or {}).get("full_time")))
+            if (sb.get("backup_info") or {}).get("full_time")
+            else None
+        ),
+        "backup_active": bool(
+            (scene.get("feature_switch") or {}).get("backup_reserve_effective")
+        ),
+        "charge_state": CHARGE_NAMES.get(
+            str(sb.get("charging_status", "")), "-"
+        ),
+        "sb_online": bool(banks) and all(str(d.get("status", "1")) == "1" for d in banks),
+        "meter_online": bool(grid_devices)
+        and all(str(d.get("status", "1")) == "1" for d in grid_devices),
+        "expansions": sum(int(_num(b.get("sub_package_num"))) for b in banks),
+        "third_party_pv": round(
+            _num(scene.get("third_party_pv")) + _num(sb.get("other_input_power"))
+        ),
         "autarky": autarky,
         "runtime_min": runtime,
-        "total_kwh": _num((stats.get("1") or {}).get("total")),
+        # Tages-, Prognose- und Verteilungswerte
+        **{k: v for k, v in (today or {}).items() if k not in ("day", "at")},
+        "today_eur": today_eur,
+        "total_kwh": total_kwh,
         "saved_eur": _num((stats.get("3") or {}).get("total")),
         "co2_kg": _num((stats.get("2") or {}).get("total")),
-        "mode": scene.get("user_scene_mode") or scene.get("scene_mode"),
     }
 
 
@@ -263,8 +317,168 @@ def normalize(scene: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def fetch_scene() -> dict:
-    """Roh-scene_info von der Anker-Cloud holen."""
+# Die Tages- und Prognosewerte aendern sich langsam und kosten eigene
+# Cloud-Aufrufe. Sie werden daher deutlich laenger vorgehalten als die
+# Momentanwerte.
+TODAY_TTL = int(os.environ.get("TODAY_TTL", "300"))
+
+# Die vier Auswertungen, die Anker getrennt liefert
+ENERGY_TYPES = ("solar_production", "home_usage", "grid", "solarbank")
+
+
+def _today_key() -> str:
+    return "solix:energy:" + datetime.now().strftime("%Y-%m-%d")
+
+
+def _today_cache() -> dict | None:
+    """Zwischenspeicher: erst Redis (ueberlebt Kaltstarts), dann /tmp."""
+    raw = kv_get(_today_key())
+    if raw is None:
+        path = TMP / "today.json"
+        raw = path.read_text(encoding="utf-8") if path.is_file() else None
+    if not raw:
+        return None
+    try:
+        cached = json.loads(raw)
+    except ValueError:
+        return None
+    if cached.get("day") != datetime.now().strftime("%Y-%m-%d"):
+        return None
+    if time.time() - cached.get("at", 0) > TODAY_TTL:
+        return None
+    return cached
+
+
+def _store_today(data: dict) -> None:
+    payload = json.dumps(data)
+    kv_set(_today_key(), payload, ttl=2 * 24 * 3600)
+    try:
+        (TMP / "today.json").write_text(payload, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _split_forecast(trend: list) -> tuple[float, float]:
+    """Trendliste in Rest-heute und Morgen teilen.
+
+    Anker liefert nur Uhrzeiten ohne Datum. Sobald die Stunde kleiner
+    wird als die vorherige, hat der naechste Tag begonnen.
+    """
+    rest_today = 0.0
+    tomorrow = 0.0
+    last_hour = -1
+    wrapped = False
+    for slot in trend:
+        label = str(slot.get("time") or "")
+        try:
+            hour = int(label.split(":")[0])
+        except (ValueError, IndexError):
+            continue
+        if hour < last_hour:
+            wrapped = True
+        last_hour = hour
+        watts = _num(slot.get("value"))
+        if wrapped:
+            tomorrow += watts
+        else:
+            rest_today += watts
+    return rest_today / 1000, tomorrow / 1000
+
+
+async def _fetch_energy(client, site_id: str, device_sn: str) -> dict:
+    """Alle Tageswerte und die Prognose. Fehler kippen den Rest nicht."""
+    cached = _today_cache()
+    if cached:
+        return cached
+
+    import asyncio
+
+    today = datetime.now()
+    stamp = today.strftime("%Y-%m-%d")
+
+    async def one(dev_type: str) -> dict:
+        return await client.energy_analysis(
+            siteId=site_id,
+            deviceSn=device_sn,
+            rangeType="day",
+            startDay=today,
+            endDay=today,
+            devType=dev_type,
+        )
+
+    answers = await asyncio.gather(
+        *(one(t) for t in ENERGY_TYPES), return_exceptions=True
+    )
+
+    parts: dict[str, dict] = {}
+    for name, answer in zip(ENERGY_TYPES, answers):
+        if isinstance(answer, BaseException):
+            LOGGER.warning("Auswertung %s fehlgeschlagen: %s", name, answer)
+            continue
+        parts[name] = answer.get("data", answer) if isinstance(answer, dict) else {}
+
+    solar = parts.get("solar_production") or {}
+    home = parts.get("home_usage") or {}
+    grid = parts.get("grid") or {}
+    bank = parts.get("solarbank") or {}
+
+    def val(source: dict, key: str) -> float | None:
+        raw = source.get(key)
+        return None if raw in (None, "") else _num(raw)
+
+    result: dict = {"day": stamp, "at": time.time()}
+
+    # Solarproduktion
+    result["today_kwh"] = val(solar, "solar_total")
+    result["today_to_home"] = val(solar, "solar_to_home_total")
+    result["today_to_bat"] = val(solar, "solar_to_battery_total")
+    result["today_to_grid"] = val(solar, "solar_to_grid_total")
+
+    produced = result["today_kwh"] or 0
+    to_home = result["today_to_home"]
+    result["today_direct_share"] = (
+        round(to_home / produced * 100) if produced > 0 and to_home is not None else None
+    )
+
+    # Prognose steckt in derselben Antwort
+    has_trend = bool(solar.get("forecast_trend"))
+    rest, tomorrow = _split_forecast(solar.get("forecast_trend") or [])
+    result["forecast_today"] = val(solar, "forecast_total") if has_trend else None
+    result["forecast_rest"] = round(rest, 2) if has_trend else None
+    result["forecast_tomorrow"] = round(tomorrow, 2) if has_trend else None
+
+    # Hausverbrauch
+    result["home_today"] = val(home, "home_usage_total")
+    result["home_from_grid"] = val(home, "grid_to_home_total")
+    result["home_from_bat"] = val(home, "battery_to_home_total")
+    result["home_from_solar"] = val(home, "solar_to_home_total")
+
+    used = result["home_today"] or 0
+    from_grid = result["home_from_grid"]
+    result["autarky_today"] = (
+        max(0, min(100, round((used - from_grid) / used * 100)))
+        if used > 0 and from_grid is not None
+        else None
+    )
+
+    # Netz
+    result["grid_import_today"] = val(grid, "grid_imported_total")
+    result["grid_export_today"] = val(grid, "solar_to_grid_total")
+    result["grid_to_bat_today"] = val(grid, "grid_to_battery_total")
+
+    # Speicher
+    result["bat_charge_today"] = val(bank, "charge_total")
+    result["bat_discharge_today"] = val(bank, "discharge_total")
+    result["bat_to_home_today"] = val(bank, "battery_to_home_total")
+    result["ac_socket_today"] = val(bank, "ac_out_put_total")
+
+    if parts:
+        _store_today(result)
+    return result
+
+
+async def fetch_all(with_today: bool = True) -> tuple[dict, dict]:
+    """Momentanwerte und optional den Tagesertrag holen."""
     from aiohttp import ClientSession
     from anker_solix_api import api  # type: ignore[import-not-found]
 
@@ -290,8 +504,21 @@ async def fetch_scene() -> dict:
             kv_set("solix:site_id", site_id, ttl=30 * 24 * 3600)
 
         scene = await client.get_scene_info(site_id)
+
+        today: dict = {}
+        if with_today:
+            banks = (scene.get("solarbank_info") or {}).get("solarbank_list") or []
+            device_sn = banks[0].get("device_sn", "") if banks else ""
+            today = await _fetch_energy(client, site_id, device_sn)
+
         _persist_auth_file(auth_file)
-        return scene
+        return scene, today
+
+
+async def fetch_scene() -> dict:
+    """Nur die Rohantwort, fuer den Diagnose-Endpoint."""
+    scene, _ = await fetch_all(with_today=False)
+    return scene
 
 
 async def get_status(force: bool = False) -> dict:
@@ -307,7 +534,8 @@ async def get_status(force: bool = False) -> dict:
         except (ValueError, OSError):
             pass
 
-    result = normalize(await fetch_scene())
+    scene, today = await fetch_all()
+    result = normalize(scene, today)
     try:
         cache_file.write_text(json.dumps(result), encoding="utf-8")
     except OSError:
